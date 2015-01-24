@@ -1,6 +1,7 @@
 (ns jmeter-load-test.core
   (:require [jmeter-load-test.init] ;; need to set some jmeter config before importing the below modules
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [clojure.core.async :as async])
   (:import [org.apache.jmeter.control LoopController]
            [org.apache.jmeter.engine StandardJMeterEngine]
            [org.apache.jmeter.protocol.http.sampler HTTPSamplerProxy]
@@ -10,11 +11,9 @@
 
 ;; See https://bitbucket.org/blazemeter/jmeter-from-code/src/57cef9e2b1c9?at=master
 
-(defn build-sampler [domain path]
+(defn build-sampler [url]
   (doto (HTTPSamplerProxy.)
-    (.setDomain domain)
-    (.setPort 80)
-    (.setPath path)
+    (.setPath url)
     (.setMethod "GET")))
 
 (defn build-loop-controller [n]
@@ -27,40 +26,48 @@
   (let [loop-controller (build-loop-controller n)]
     (doto (org.apache.jmeter.threads.ThreadGroup.)
       (.setNumThreads c)
-      (.setRampUp 1)
       (.setSamplerController loop-controller))))
 
-(defn -main [domain n threads]
+(defn build-logger [chan]
+  (ResultCollector. (proxy [Summariser] []
+                      (sampleOccurred [e]
+                        (async/go (async/>! chan (.getResult e))))
+                      (testStarted [_])
+                      (testEnded [_]))))
+
+(defn result->map [result]
+  {:response-code (.getResponseCode result)
+   :start-time (.getStartTime result)
+   :end-time (.getEndTime result)
+   :timestamp (.getTimeStamp result)
+   :response-time (.getTime result)
+   :url (.getURL result)
+   :success? (.isSuccessful result)})
+
+(defn blast! [url n concurrency c]
   (let [jmeter-home (.getPath (io/resource "jmeter"))
         jmeter (StandardJMeterEngine.)
         test-plan-tree (HashTree.)
         test-plan (TestPlan.)
-        my-summariser (proxy [Summariser] []
-                        (sampleOccurred [e]
-                          (let [res (.getResult e)]
-                            (println {:response-code (.getResponseCode res)
-                                      :start-time (.getStartTime res)
-                                      :end-time (.getEndTime res)
-                                      :timestamp (.getTimeStamp res)
-                                      :response-time (.getTime res)
-                                      :url (.getURL res)
-                                      :success? (.isSuccessful res)})))
-                        (testStarted [_])
-                        (testEnded [_]))
-        logger (ResultCollector. my-summariser)]
+        results-chan (async/chan 1 (map result->map))
+        logger (build-logger results-chan)]
+
+    (async/pipe results-chan c)
 
     ;; Construct Test Plan from previously initialized elements
     (.add test-plan-tree test-plan)
-    (doto (.add test-plan-tree test-plan (build-thread-group n threads))
-      (.add (build-sampler "gocardless.com" "/")))
+    (doto (.add test-plan-tree test-plan (build-thread-group n concurrency))
+      (.add (build-sampler url)))
 
-    ;; Store execution results into a .jtl file
-    ; (.setFilename logger (str jmeter-home "/example.jtl"))
     (.add test-plan-tree (aget (.getArray test-plan-tree) 0) logger)
 
     ;; Run Test Plan
     (.configure jmeter test-plan-tree)
     (.run jmeter)
-    (println "DONE")))
+    nil))
 
-(comment (-main "gocardless.com" 10 5))
+(defn -main [url n concurrency]
+  (let [results-chan (async/chan (async/dropping-buffer 1) (map println))]
+    (blast! url n concurrency results-chan)))
+
+(comment (-main "https://gocardless.com/about" 1 5))
